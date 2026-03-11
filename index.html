@@ -1,0 +1,924 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>CTF AI Sandbox</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #0d0d0d;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: 100vh;
+    font-family: 'Courier New', monospace;
+    color: #555;
+    gap: 20px;
+  }
+  #wrap {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  canvas {
+    display: block;
+    border: 1px solid #333;
+  }
+  #hud {
+    display: flex;
+    justify-content: space-between;
+    font-size: 11px;
+    letter-spacing: 0.05em;
+    padding: 0 2px;
+  }
+  #score-red { color: #cc3333; }
+  #score-blue { color: #3366cc; }
+  #legend { color: #333; }
+  #sidebar {
+    width: 200px;
+    font-size: 10px;
+    line-height: 1.8;
+    color: #333;
+  }
+  .side-block { margin-bottom: 16px; }
+  .side-label { color: #444; letter-spacing: 0.1em; margin-bottom: 4px; }
+  .cond-row { display: flex; justify-content: space-between; }
+  .cond-val { color: #222; }
+  .cond-val.on { color: #888; }
+  #selected-id { color: #555; margin-bottom: 8px; }
+</style>
+</head>
+<body>
+<div id="sidebar">
+  <div class="side-block">
+    <div class="side-label">// CONDITIONS</div>
+    <div id="cond-panel">click agent to inspect</div>
+  </div>
+  <div class="side-block">
+    <div class="side-label">// ROLES</div>
+    <div class="cond-row"><span>attacker</span><span class="cond-val">→ enemy flag</span></div>
+    <div class="cond-row"><span>healer</span><span class="cond-val">→ revive + engage</span></div>
+    <div class="cond-row"><span>support</span><span class="cond-val">→ hold mid</span></div>
+    <div class="cond-row"><span>escort</span><span class="cond-val">→ screen carrier</span></div>
+    <div class="cond-row"><span>carrier</span><span class="cond-val">→ own base</span></div>
+    <div class="cond-row"><span>retriever</span><span class="cond-val">→ flag carrier</span></div>
+    <div class="cond-row"><span>defender</span><span class="cond-val">→ own flag</span></div>
+  </div>
+  <div class="side-block">
+    <div class="side-label">// CONTROLS</div>
+    <div>click — inspect agent</div>
+    <div>space — pause</div>
+    <div>r — reset</div>
+  </div>
+</div>
+
+<div id="wrap">
+  <canvas id="field" width="480" height="360"></canvas>
+  <div id="hud">
+    <span id="score-red">RED  0</span>
+    <span id="legend">A=attacker  S=support  E=escort  C=carrier  R=retriever  D=defender</span>
+    <span id="score-blue">0  BLUE</span>
+  </div>
+</div>
+
+<script>
+const canvas = document.getElementById('field');
+const ctx = canvas.getContext('2d');
+const W = canvas.width, H = canvas.height;
+const WALL = 8;
+
+// ── State ────────────────────────────────────────────────────────────────────
+
+let paused = false;
+let selectedId = null;
+let scores = { red: 0, blue: 0 };
+
+const BASES = {
+  red:  { x: 36,     y: H - 36 },
+  blue: { x: W - 36, y: 36     },
+};
+
+let FLAGS = {
+  red:  { pos: { x: 36,     y: H - 36 }, carrier: null },
+  blue: { pos: { x: W - 36, y: 36     }, carrier: null },
+};
+
+const BLOCKS = [
+  // boundary walls
+  { x: 0,      y: 0,      w: W,    h: WALL },
+  { x: 0,      y: H-WALL, w: W,    h: WALL },
+  { x: 0,      y: 0,      w: WALL, h: H    },
+  { x: W-WALL, y: 0,      w: WALL, h: H    },
+
+  // ── central breach wall — asymmetric ─────────────────
+  // Red side (left): two wide gaps — easy to push through
+  { x: 8,   y: 175, w: 60,  h: 10 }, // short seg
+  { x: 108, y: 175, w: 60,  h: 10 }, // short seg
+  // Center: solid block — forces flanking
+  { x: 208, y: 175, w: 64,  h: 10 },
+  // Blue side (right): one narrow gap only — bottleneck
+  { x: 312, y: 175, w: 80,  h: 10 },
+  { x: 432, y: 175, w: 40,  h: 10 },
+
+  // ── blue fortress (top-right) ─────────────────────────
+  // Outer ring — forces attacker to commit to one entry
+  { x: 340, y:  8,  w: 10,  h: 90  }, // left wall of fort
+  { x: 340, y:  8,  w: 132, h: 10  }, // top wall of fort
+  // Inner cover for defenders
+  { x: 380, y:  50, w: 40,  h: 10  }, // inner shelf
+  { x: 390, y:  60, w: 10,  h: 40  }, // inner pillar
+
+  // ── blue approach chokepoint ──────────────────────────
+  // Narrows the corridor attackers must use to reach blue flag
+  { x: 290, y:  90, w: 10,  h: 60  }, // left jaw
+  { x: 340, y:  90, w: 10,  h: 60  }, // right jaw (gap ~40px)
+
+  // ── red side — open, minimal cover ───────────────────
+  // Just one small rock — barely useful
+  { x: 100, y: 260, w: 24,  h: 10  },
+
+  // ── mid-field cover favoring blue retreat ─────────────
+  { x: 310, y: 260, w: 10,  h: 50  }, // blue can duck behind this retreating
+  { x: 360, y: 290, w: 50,  h: 10  },
+];
+
+function makeAgent(id, team, x, y) {
+  return {
+    id, team,
+    pos:           { x, y },
+    spawn:         { x, y },
+    carrying:      null,
+    role:          'attacker',
+    percepts:      {},
+    hp:            1,
+    shoot_cd:      0,
+    shoot_flash:   null,
+    respawn_timer: 0,
+  };
+}
+
+let AGENTS = [
+  // red — bottom-left cluster
+  makeAgent('r0',  'red',  46, H-46),
+  makeAgent('r1',  'red',  26, H-66),
+  makeAgent('r2',  'red',  66, H-26),
+  makeAgent('r3',  'red',  46, H-76),
+  makeAgent('r4',  'red',  76, H-46),
+  makeAgent('r5',  'red',  26, H-96),
+  makeAgent('r6',  'red',  96, H-26),
+  makeAgent('r7',  'red',  56, H-96),
+  makeAgent('r8',  'red',  96, H-56),
+  makeAgent('r9',  'red',  36, H-116),
+  makeAgent('r10', 'red', 116, H-36),
+  makeAgent('r11', 'red',  66, H-116),
+  makeAgent('r12', 'red', 116, H-66),
+  makeAgent('r13', 'red',  46, H-136),
+  makeAgent('r14', 'red', 136, H-46),
+  // blue — top-right cluster
+  makeAgent('b0',  'blue', W-46,  46),
+  makeAgent('b1',  'blue', W-26,  66),
+  makeAgent('b2',  'blue', W-66,  26),
+  makeAgent('b3',  'blue', W-46,  76),
+  makeAgent('b4',  'blue', W-76,  46),
+  makeAgent('b5',  'blue', W-26,  96),
+  makeAgent('b6',  'blue', W-96,  26),
+  makeAgent('b7',  'blue', W-56,  96),
+  makeAgent('b8',  'blue', W-96,  56),
+  makeAgent('b9',  'blue', W-36, 116),
+  makeAgent('b10', 'blue', W-116, 36),
+  makeAgent('b11', 'blue', W-66, 116),
+  makeAgent('b12', 'blue', W-116, 66),
+  makeAgent('b13', 'blue', W-46, 136),
+  makeAgent('b14', 'blue', W-136, 46),
+];
+
+// ── Geometry helpers ──────────────────────────────────────────────────────────
+
+function dist(a, b) {
+  const dx = b.x - a.x, dy = b.y - a.y;
+  return Math.sqrt(dx*dx + dy*dy);
+}
+
+function norm(v) {
+  const l = Math.sqrt(v.x*v.x + v.y*v.y);
+  return l < 1e-4 ? { x:0, y:0 } : { x: v.x/l, y: v.y/l };
+}
+
+function raycastClear(from, to) {
+  const dx = to.x - from.x, dy = to.y - from.y;
+  const steps = Math.ceil(dist(from, to) / 5);
+  for (let i = 1; i < steps; i++) {
+    const t = i / steps;
+    const px = from.x + dx*t, py = from.y + dy*t;
+    for (const b of BLOCKS) {
+      if (px >= b.x && px <= b.x+b.w && py >= b.y && py <= b.y+b.h) return false;
+    }
+  }
+  return true;
+}
+
+function closestPointOnBlock(b, p) {
+  return {
+    x: Math.max(b.x, Math.min(p.x, b.x + b.w)),
+    y: Math.max(b.y, Math.min(p.y, b.y + b.h)),
+  };
+}
+
+// ── Cover ─────────────────────────────────────────────────────────────────────
+
+const AGENT_RADIUS = 4;
+const COVER_OFFSET = AGENT_RADIUS + 3;
+
+function is_cover(block) {
+  return block.w > AGENT_RADIUS * 2 || block.h > AGENT_RADIUS * 2;
+}
+
+function posValid(pos) {
+  for (const b of BLOCKS) {
+    if (pos.x >= b.x && pos.x <= b.x+b.w &&
+        pos.y >= b.y && pos.y <= b.y+b.h) return false;
+  }
+  return (pos.x > WALL && pos.x < W-WALL && pos.y > WALL && pos.y < H-WALL);
+}
+
+function coverCandidates(block) {
+  const cx = block.x + block.w / 2;
+  const cy = block.y + block.h / 2;
+  return [
+    { x: cx,                               y: block.y - COVER_OFFSET,            face: 'top'    },
+    { x: cx,                               y: block.y + block.h + COVER_OFFSET,  face: 'bottom' },
+    { x: block.x - COVER_OFFSET,           y: cy,                                face: 'left'   },
+    { x: block.x + block.w + COVER_OFFSET, y: cy,                                face: 'right'  },
+  ];
+}
+
+function find_cover(agent, threat_pos) {
+  let best = null;
+  let bestDist = Infinity;
+
+  for (const block of BLOCKS) {
+    if (!is_cover(block)) continue;
+
+    for (const candidate of coverCandidates(block)) {
+      if (!posValid(candidate)) continue;
+
+      if (raycastClear(candidate, threat_pos)) continue;
+
+      const d = dist(agent.pos, candidate);
+      if (d < bestDist) {
+        bestDist = d;
+        best = candidate;
+      }
+    }
+  }
+
+  return best;
+}
+
+// ── Conditions ────────────────────────────────────────────────────────────────
+
+function evalConditions(agent) {
+  const enemy  = agent.team === 'red' ? 'blue' : 'red';
+  const friend = agent.team;
+  const ef = FLAGS[enemy];
+  const ff = FLAGS[friend];
+
+  const THREAT_RANGE = agent.role === 'healer' ? HEALER_THREAT_RANGE : 45;
+
+  const visible_friends = AGENTS.filter(a => {
+    if (a.id === agent.id) return false;
+    if (a.team !== agent.team) return false;
+    if (a.hp === 0) return false;
+    return dist(agent.pos, a.pos) < THREAT_RANGE && raycastClear(agent.pos, a.pos);
+  });
+
+  const visible_enemies = AGENTS.filter(a => {
+    if (a.team === agent.team) return false;
+    if (a.hp === 0) return false;
+    return dist(agent.pos, a.pos) < THREAT_RANGE && raycastClear(agent.pos, a.pos);
+  });
+
+  const enemy_carrier_agent    = ef.carrier ? AGENTS.find(a => a.id === ef.carrier) : null;
+  const friendly_carrier_agent = ff.carrier ? AGENTS.find(a => a.id === ff.carrier) : null;
+
+  return {
+    carrying_enemy_flag:    agent.carrying === enemy,
+    enemy_flag_taken:       ef.carrier !== null,
+    friendly_flag_taken:    ff.carrier !== null,
+    i_am_flag_carrier:      ef.carrier === agent.id,
+    can_see_enemy_flag:     raycastClear(agent.pos, ef.pos),
+    can_see_friendly_flag:  raycastClear(agent.pos, ff.pos),
+    enemy_flag_pos:         { ...ef.pos },
+    friendly_flag_pos:      { ...ff.pos },
+    friendly_base:          { ...BASES[friend] },
+    enemy_base:             { ...BASES[enemy] },
+    enemy_carrier_pos:      enemy_carrier_agent    ? { ...enemy_carrier_agent.pos }    : null,
+    friendly_carrier_pos:   friendly_carrier_agent ? { ...friendly_carrier_agent.pos } : null,
+    visible_enemies,
+    visible_friends,
+    enemy_team:  enemy,
+    friend_team: friend,
+    near_enemy_flag:    dist(agent.pos, ef.pos) < 14,
+    near_friendly_base: dist(agent.pos, BASES[friend]) < 14,
+    threat_to_carrier:  friendly_carrier_agent
+      ? visible_enemies.some(e => dist(e.pos, friendly_carrier_agent.pos) < dist(agent.pos, friendly_carrier_agent.pos))
+      : false,
+    nearest_threat: visible_enemies.length > 0
+      ? visible_enemies.reduce((a, b) => dist(agent.pos, a.pos) < dist(agent.pos, b.pos) ? a : b)
+      : null,
+    in_cover: visible_enemies.length > 0
+      ? !raycastClear(agent.pos, visible_enemies.reduce((a,b) =>
+          dist(agent.pos,a.pos)<dist(agent.pos,b.pos)?a:b).pos)
+      : false,
+    friends_attacking:  visible_friends.filter(f => f.role === 'attacker').length,
+    friends_at_flag:    visible_friends.filter(f => dist(f.pos, ef.pos) < 60).length,
+    friends_retrieving: visible_friends.filter(f => f.role === 'retriever').length,
+    friends_escorting:  visible_friends.filter(f => f.role === 'escort').length,
+    crowded_at_enemy_flag: visible_friends.filter(f =>
+      dist(f.pos, ef.pos) < 80 ||
+      (f.role === 'attacker' && dist(f.pos, ef.pos) < 160)
+    ).length >= 3,
+    carrier_uncontested: enemy_carrier_agent
+      ? !visible_friends.some(f =>
+          f.role === 'retriever' && dist(f.pos, enemy_carrier_agent.pos) < 120)
+      : false,
+  };
+}
+
+// ── Shoot ─────────────────────────────────────────────────────────────────────
+
+const SHOOT_RANGE    = AGENT_RADIUS * 10;
+const SHOOT_COOLDOWN = 50;
+const HIT_PROB       = 0.18;
+const RESPAWN_DELAY  = 200;
+
+const HEALER_THREAT_RANGE = 45 * 2;
+const HEALER_SHOOT_RANGE  = SHOOT_RANGE * 2;
+const HEALER_RATE         = 2;
+const HEAL_RADIUS         = 20;
+
+function shoot(agent, c) {
+  if (agent.shoot_cd > 0) return false;
+  if (agent.role === 'carrier') return false;
+
+  let shootTarget = null;
+
+  if (agent.role === 'escort' || agent.role === 'defender' || agent.role === 'retriever') {
+    const threatening = c.visible_enemies.filter(e =>
+      dist(e.pos, agent.pos) < SHOOT_RANGE
+    );
+    if (threatening.length > 0) {
+      shootTarget = threatening.reduce((a, b) =>
+        dist(agent.pos, a.pos) < dist(agent.pos, b.pos) ? a : b
+      );
+    }
+  } else {
+    const myShootRange = agent.role === 'healer' ? HEALER_SHOOT_RANGE : SHOOT_RANGE;
+    const inRange = c.visible_enemies.filter(e => dist(agent.pos, e.pos) < myShootRange);
+    if (inRange.length > 0) {
+      shootTarget = inRange.reduce((a, b) =>
+        dist(agent.pos, a.pos) < dist(agent.pos, b.pos) ? a : b
+      );
+    }
+  }
+
+  if (!shootTarget) return false;
+  if (!raycastClear(agent.pos, shootTarget.pos)) return false;
+
+  agent.shoot_cd = SHOOT_COOLDOWN;
+  agent.shoot_flash = { x: shootTarget.pos.x, y: shootTarget.pos.y, ttl: 6 };
+
+  if (Math.random() < HIT_PROB) {
+    kill(shootTarget);
+  }
+  return true;
+}
+
+function kill(agent) {
+  if (agent.carrying) {
+    FLAGS[agent.carrying].carrier = null;
+    FLAGS[agent.carrying].pos = { ...agent.pos };
+    agent.carrying = null;
+  }
+  agent.hp = 0;
+  agent.respawn_timer = RESPAWN_DELAY;
+}
+
+function heal(healer) {
+  AGENTS.forEach(a => {
+    if (a.team !== healer.team) return;
+    if (a.hp !== 0) return;
+    if (dist(healer.pos, a.spawn) > HEAL_RADIUS) return;
+    a.respawn_timer = Math.max(0, a.respawn_timer - HEALER_RATE);
+  });
+}
+
+// ── FIX 1: respawnTick was missing its function declaration ───────────────────
+function respawnTick(agent) {
+  if (agent.hp === 1) return;
+  agent.respawn_timer--;
+  if (agent.respawn_timer <= 0) {
+    agent.hp = 1;
+    agent.pos = { ...agent.spawn };
+    agent.shoot_cd = 0;
+  }
+}
+
+// ── Role + Target ─────────────────────────────────────────────────────────────
+
+function selectRole(agent, c) {
+  if (agent.hp === 0) return 'dead';
+  if (c.carrying_enemy_flag) return 'carrier';
+
+  const idx = parseInt(agent.id.slice(1));
+
+  if (idx === 7 || idx === 8) return 'healer';
+
+  if (c.friendly_flag_taken && c.carrier_uncontested) return 'retriever';
+  if (c.friendly_flag_taken) return 'retriever';
+
+  if (idx >= 12) return 'defender';
+  if (idx >= 9)  return 'escort';
+
+  if (c.crowded_at_enemy_flag) return 'support';
+
+  return 'attacker';
+}
+
+// ── FIX 2: agent threaded in as third param so healer branch can use it ───────
+function selectTarget(role, c, agent) {
+  switch (role) {
+    case 'carrier':
+      return c.friendly_base;
+
+    case 'retriever':
+      return c.enemy_carrier_pos ?? c.friendly_flag_pos;
+
+    case 'defender':
+      return c.friendly_flag_pos;
+
+    case 'escort': {
+      if (!c.friendly_carrier_pos) return c.enemy_flag_pos;
+      if (c.nearest_threat) {
+        const toThreat = norm({
+          x: c.nearest_threat.pos.x - c.friendly_carrier_pos.x,
+          y: c.nearest_threat.pos.y - c.friendly_carrier_pos.y,
+        });
+        return {
+          x: c.friendly_carrier_pos.x + toThreat.x * 22,
+          y: c.friendly_carrier_pos.y + toThreat.y * 22,
+        };
+      }
+      return c.friendly_carrier_pos;
+    }
+
+    case 'healer': {
+      const downed = AGENTS.filter(a =>
+        a.team === c.friend_team &&    // was agent.team — agent is now available but c.friend_team is cleaner
+        a.hp === 0 &&
+        dist(agent.pos, a.spawn) < 200 // was a.pos — spawn is where they'll rez
+      );
+      if (downed.length > 0) {
+        return downed.reduce((a, b) =>
+          dist(agent.pos, a.spawn) < dist(agent.pos, b.spawn) ? a : b
+        ).spawn;
+      }
+      return {
+        x: (c.friendly_base.x + c.enemy_flag_pos.x) / 2,
+        y: (c.friendly_base.y + c.enemy_flag_pos.y) / 2,
+      };
+    }
+
+    case 'support': {
+      return {
+        x: (c.friendly_base.x + c.enemy_flag_pos.x) / 2,
+        y: (c.friendly_base.y + c.enemy_flag_pos.y) / 2,
+      };
+    }
+
+    case 'attacker':
+    default:
+      return c.enemy_flag_pos;
+  }
+}
+
+// ── Interaction ───────────────────────────────────────────────────────────────
+
+function interact(agent, c) {
+  const enemy = c.enemy_team;
+
+  if (!agent.carrying && FLAGS[enemy].carrier === null && dist(agent.pos, FLAGS[enemy].pos) < 9) {
+    agent.carrying = enemy;
+    FLAGS[enemy].carrier = agent.id;
+  }
+
+  if (agent.carrying && dist(agent.pos, BASES[agent.team]) < 9) {
+    scores[agent.team]++;
+    FLAGS[agent.carrying].carrier = null;
+    FLAGS[agent.carrying].pos = { ...BASES[agent.carrying] };
+    agent.carrying = null;
+    document.getElementById('score-red').textContent  = `RED  ${scores.red}`;
+    document.getElementById('score-blue').textContent = `${scores.blue}  BLUE`;
+  }
+}
+
+// ── Movement ──────────────────────────────────────────────────────────────────
+
+function blockRepulsion(pos) {
+  let fx = 0, fy = 0;
+  const R = 14;
+  for (const b of BLOCKS) {
+    const cp = closestPointOnBlock(b, pos);
+    const dx = pos.x - cp.x, dy = pos.y - cp.y;
+    const d = Math.sqrt(dx*dx + dy*dy);
+    if (d < R && d > 0) {
+      const s = (R - d) / R;
+      fx += (dx/d) * s * 4;
+      fy += (dy/d) * s * 4;
+    }
+  }
+  return { x: fx, y: fy };
+}
+
+function agentSep(agent) {
+  let fx = 0, fy = 0;
+  const R = 10;
+  for (const o of AGENTS) {
+    if (o.id === agent.id) continue;
+    const dx = agent.pos.x - o.pos.x, dy = agent.pos.y - o.pos.y;
+    const d = Math.sqrt(dx*dx + dy*dy);
+    if (d < R && d > 0) {
+      fx += (dx/d) * (R - d) * 0.6;
+      fy += (dy/d) * (R - d) * 0.6;
+    }
+  }
+  return { x: fx, y: fy };
+}
+
+const SPEED = 1.4;
+
+function moveAgent(agent, target, c) {
+  if (!target) return;
+  if (agent.hp === 0) return;
+
+  const toTarget = { x: target.x - agent.pos.x, y: target.y - agent.pos.y };
+  const missionDir = norm(toTarget);
+
+  let coverDir = { x: 0, y: 0 };
+  agent.cover_target = null;
+
+  if (c && c.nearest_threat && !c.in_cover && agent.role !== 'carrier') {
+    const cover = find_cover(agent, c.nearest_threat.pos);
+    if (cover) {
+      const toCover = { x: cover.x - agent.pos.x, y: cover.y - agent.pos.y };
+      if (dist({ x:0,y:0 }, toCover) > COVER_OFFSET + 2) {
+        coverDir = norm(toCover);
+        agent.cover_target = cover;
+      }
+    }
+  }
+
+  const blended = {
+    x: missionDir.x + coverDir.x,
+    y: missionDir.y + coverDir.y,
+  };
+  const moveDir = norm(blended);
+
+  const rep = blockRepulsion(agent.pos);
+  const sep = agentSep(agent);
+
+  const raw = {
+    x: moveDir.x * SPEED + rep.x + sep.x,
+    y: moveDir.y * SPEED + rep.y + sep.y,
+  };
+  const final = norm(raw);
+
+  agent.pos.x = Math.max(WALL + 2, Math.min(W - WALL - 2, agent.pos.x + final.x * SPEED));
+  agent.pos.y = Math.max(WALL + 2, Math.min(H - WALL - 2, agent.pos.y + final.y * SPEED));
+
+  if (agent.carrying) {
+    FLAGS[agent.carrying].pos = { ...agent.pos };
+  }
+}
+
+// ── Tick ──────────────────────────────────────────────────────────────────────
+
+function tick() {
+  for (const a of AGENTS) {
+    if (a.shoot_cd > 0) a.shoot_cd--;
+    if (a.shoot_flash && --a.shoot_flash.ttl <= 0) a.shoot_flash = null;
+
+    if (a.hp === 0) { respawnTick(a); continue; }
+
+    const c      = evalConditions(a);
+    interact(a, c);
+    const role   = selectRole(a, c);
+    const target = selectTarget(role, c, a);   // FIX 2: pass agent
+    a.role     = role;
+    a.percepts = c;
+    shoot(a, c);
+    if (role === 'healer') heal(a);
+    moveAgent(a, target, c);
+  }
+}
+
+// ── Render ────────────────────────────────────────────────────────────────────
+
+const COLORS = {
+  red:  '#cc3333',
+  blue: '#3366cc',
+};
+
+const ROLE_MARKER = { attacker:'A', carrier:'C', retriever:'R', defender:'D', escort:'E', support:'S', healer:'H', dead:'×' };
+
+function drawBlocks() {
+  ctx.fillStyle = '#1e1e1e';
+  for (const b of BLOCKS) ctx.fillRect(b.x, b.y, b.w, b.h);
+  ctx.strokeStyle = '#2a2a2a';
+  ctx.lineWidth = 1;
+  for (const b of BLOCKS) ctx.strokeRect(b.x, b.y, b.w, b.h);
+
+  for (const b of BLOCKS) {
+    if (!is_cover(b)) continue;
+    for (const cp of coverCandidates(b)) {
+      if (!posValid(cp)) continue;
+      ctx.beginPath();
+      ctx.arc(cp.x, cp.y, 1.2, 0, Math.PI*2);
+      ctx.fillStyle = '#ffffff08';
+      ctx.fill();
+    }
+  }
+}
+
+function drawBase(team) {
+  const p = BASES[team];
+  ctx.beginPath();
+  ctx.arc(p.x, p.y, 22, 0, Math.PI*2);
+  ctx.fillStyle   = team === 'red' ? '#cc333314' : '#3366cc14';
+  ctx.strokeStyle = team === 'red' ? '#cc333344' : '#3366cc44';
+  ctx.lineWidth = 1;
+  ctx.fill();
+  ctx.stroke();
+}
+
+function drawFlag(team, flag) {
+  const c = COLORS[team];
+  ctx.beginPath();
+  ctx.arc(flag.pos.x, flag.pos.y, 5, 0, Math.PI*2);
+  ctx.fillStyle   = flag.carrier ? '#0d0d0d' : c;
+  ctx.strokeStyle = c;
+  ctx.lineWidth   = flag.carrier ? 2 : 1.5;
+  ctx.fill();
+  ctx.stroke();
+}
+
+function drawLoS(agent) {
+  const c  = COLORS[agent.team];
+  const ef = FLAGS[agent.percepts.enemy_team];
+  if (!ef) return;
+  if (agent.percepts.can_see_enemy_flag && agent.role === 'attacker') {
+    ctx.beginPath();
+    ctx.moveTo(agent.pos.x, agent.pos.y);
+    ctx.lineTo(ef.pos.x, ef.pos.y);
+    ctx.strokeStyle = c + '18';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+  }
+}
+
+function drawAgent(agent) {
+  const c   = COLORS[agent.team];
+  const sel = agent.id === selectedId;
+
+  if (agent.hp === 0) {
+    const progress = 1 - (agent.respawn_timer / RESPAWN_DELAY);
+    ctx.beginPath();
+    ctx.arc(agent.pos.x, agent.pos.y, 4, 0, Math.PI * 2 * progress);
+    ctx.strokeStyle = c + '33';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+    return;
+  }
+
+  if (sel) {
+    ctx.beginPath();
+    ctx.arc(agent.pos.x, agent.pos.y, 9, 0, Math.PI*2);
+    ctx.strokeStyle = '#ffffff33';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+  }
+
+  if (agent.role === 'healer') {
+    ctx.beginPath();
+    ctx.arc(agent.pos.x, agent.pos.y, HEALER_THREAT_RANGE, 0, Math.PI*2);
+    ctx.strokeStyle = '#00eeff18';
+    ctx.lineWidth   = 0.5;
+    ctx.stroke();
+  }
+
+  const roleColor = {
+    carrier:   '#ddbb00',
+    retriever: '#dd7700',
+    defender:  '#44aa66',
+    escort:    '#aa44dd',
+    support:   '#448888',
+    healer:    '#00eeff',
+    attacker:  c,
+  }[agent.role] ?? c;
+
+  ctx.beginPath();
+  ctx.arc(agent.pos.x, agent.pos.y, 4, 0, Math.PI*2);
+  ctx.fillStyle   = roleColor;
+  ctx.strokeStyle = '#0d0d0d';
+  ctx.lineWidth   = 1;
+  ctx.fill();
+  ctx.stroke();
+
+  ctx.fillStyle = '#0d0d0dcc';
+  ctx.font      = 'bold 4px Courier New';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(ROLE_MARKER[agent.role] ?? '?', agent.pos.x, agent.pos.y);
+
+  if (agent.shoot_flash) {
+    const alpha = agent.shoot_flash.ttl / 6;
+    ctx.beginPath();
+    ctx.moveTo(agent.pos.x, agent.pos.y);
+    ctx.lineTo(agent.shoot_flash.x, agent.shoot_flash.y);
+    ctx.strokeStyle = c + Math.floor(alpha * 255).toString(16).padStart(2,'0');
+    ctx.lineWidth = 0.8;
+    ctx.stroke();
+  }
+}
+
+function drawCondPanel(agent) {
+  if (!agent) {
+    document.getElementById('cond-panel').innerHTML = 'click agent to inspect';
+    return;
+  }
+  const c = agent.percepts;
+  const rows = [
+    ['carrying_enemy_flag',   c.carrying_enemy_flag],
+    ['enemy_flag_taken',      c.enemy_flag_taken],
+    ['friendly_flag_taken',   c.friendly_flag_taken],
+    ['can_see_enemy_flag',    c.can_see_enemy_flag],
+    ['can_see_friendly_flag', c.can_see_friendly_flag],
+    ['near_enemy_flag',       c.near_enemy_flag],
+    ['near_friendly_base',    c.near_friendly_base],
+    ['threat_to_carrier',     c.threat_to_carrier],
+    ['visible_enemies',       c.visible_enemies?.length ?? 0],
+    ['in_cover',              c.in_cover],
+    ['nearest_threat',        c.nearest_threat ? c.nearest_threat.id : 'none'],
+    ['shoot_cd',              agent.shoot_cd],
+    ['visible_friends',       c.visible_friends?.length ?? 0],
+    ['friends_attacking',     c.friends_attacking],
+    ['friends_at_flag',       c.friends_at_flag],
+    ['crowded_at_enemy_flag', c.crowded_at_enemy_flag],
+    ['carrier_uncontested',   c.carrier_uncontested],
+  ];
+  const color = COLORS[agent.team];
+  document.getElementById('cond-panel').innerHTML =
+    `<div style="color:${color};margin-bottom:6px">${agent.id} [${agent.role}]</div>` +
+    rows.map(([k, v]) => {
+      const on  = v === true || (typeof v === 'number' && v > 0);
+      const val = typeof v === 'boolean' ? (v ? 'true' : 'false') : v;
+      return `<div class="cond-row">
+        <span style="color:#333">${k}</span>
+        <span class="cond-val ${on ? 'on' : ''}">${val}</span>
+      </div>`;
+    }).join('');
+}
+
+function render() {
+  ctx.fillStyle = '#0d0d0d';
+  ctx.fillRect(0, 0, W, H);
+
+  drawBase('red');
+  drawBase('blue');
+  drawBlocks();
+
+  for (const a of AGENTS) drawLoS(a);
+
+  drawFlag('red',  FLAGS.red);
+  drawFlag('blue', FLAGS.blue);
+  for (const a of AGENTS) drawAgent(a);
+
+  const sel = AGENTS.find(a => a.id === selectedId);
+  if (sel && sel.percepts) {
+    const target = selectTarget(sel.role, sel.percepts, sel);   // FIX 2: pass agent
+
+    if (target) {
+      ctx.beginPath();
+      ctx.moveTo(sel.pos.x, sel.pos.y);
+      ctx.lineTo(target.x, target.y);
+      ctx.strokeStyle = COLORS[sel.team] + '33';
+      ctx.lineWidth = 1;
+      ctx.setLineDash([3, 4]);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+
+    if (sel.cover_target) {
+      ctx.beginPath();
+      ctx.moveTo(sel.pos.x, sel.pos.y);
+      ctx.lineTo(sel.cover_target.x, sel.cover_target.y);
+      ctx.strokeStyle = '#ffffff66';
+      ctx.lineWidth = 1;
+      ctx.stroke();
+
+      ctx.beginPath();
+      ctx.arc(sel.cover_target.x, sel.cover_target.y, 3, 0, Math.PI*2);
+      ctx.strokeStyle = '#ffffff44';
+      ctx.lineWidth = 1;
+      ctx.stroke();
+    }
+
+    if (sel.percepts.nearest_threat) {
+      const t = sel.percepts.nearest_threat;
+      ctx.beginPath();
+      ctx.moveTo(sel.pos.x, sel.pos.y);
+      ctx.lineTo(t.pos.x, t.pos.y);
+      ctx.strokeStyle = '#ff000044';
+      ctx.lineWidth = 1;
+      ctx.setLineDash([2, 3]);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+
+    drawCondPanel(sel);
+  } else {
+    drawCondPanel(null);
+  }
+}
+
+// ── Loop ──────────────────────────────────────────────────────────────────────
+
+function loop() {
+  if (!paused) tick();
+  render();
+  requestAnimationFrame(loop);
+}
+
+// ── Input ─────────────────────────────────────────────────────────────────────
+
+canvas.addEventListener('click', e => {
+  const r   = canvas.getBoundingClientRect();
+  const mx  = e.clientX - r.left;
+  const my  = e.clientY - r.top;
+  const hit = AGENTS.find(a => dist(a.pos, { x: mx, y: my }) < 12);
+  selectedId = hit ? hit.id : null;
+});
+
+document.addEventListener('keydown', e => {
+  if (e.code === 'Space') {
+    e.preventDefault();
+    paused = !paused;
+  }
+  if (e.key === 'r' || e.key === 'R') {
+    scores = { red: 0, blue: 0 };
+    FLAGS = {
+      red:  { pos: { x: 36,     y: H-36 }, carrier: null },
+      blue: { pos: { x: W-36,   y: 36   }, carrier: null },
+    };
+    AGENTS = [
+      makeAgent('r0',  'red',  46, H-46),
+      makeAgent('r1',  'red',  26, H-66),
+      makeAgent('r2',  'red',  66, H-26),
+      makeAgent('r3',  'red',  46, H-76),
+      makeAgent('r4',  'red',  76, H-46),
+      makeAgent('r5',  'red',  26, H-96),
+      makeAgent('r6',  'red',  96, H-26),
+      makeAgent('r7',  'red',  56, H-96),
+      makeAgent('r8',  'red',  96, H-56),
+      makeAgent('r9',  'red',  36, H-116),
+      makeAgent('r10', 'red', 116, H-36),
+      makeAgent('r11', 'red',  66, H-116),
+      makeAgent('r12', 'red', 116, H-66),
+      makeAgent('r13', 'red',  46, H-136),
+      makeAgent('r14', 'red', 136, H-46),
+      makeAgent('b0',  'blue', W-46,  46),
+      makeAgent('b1',  'blue', W-26,  66),
+      makeAgent('b2',  'blue', W-66,  26),
+      makeAgent('b3',  'blue', W-46,  76),
+      makeAgent('b4',  'blue', W-76,  46),
+      makeAgent('b5',  'blue', W-26,  96),
+      makeAgent('b6',  'blue', W-96,  26),
+      makeAgent('b7',  'blue', W-56,  96),
+      makeAgent('b8',  'blue', W-96,  56),
+      makeAgent('b9',  'blue', W-36, 116),
+      makeAgent('b10', 'blue', W-116, 36),
+      makeAgent('b11', 'blue', W-66, 116),
+      makeAgent('b12', 'blue', W-116, 66),
+      makeAgent('b13', 'blue', W-46, 136),
+      makeAgent('b14', 'blue', W-136, 46),
+    ];
+    document.getElementById('score-red').textContent  = 'RED  0';
+    document.getElementById('score-blue').textContent = '0  BLUE';
+    selectedId = null;
+  }
+});
+
+loop();
+</script>
+</body>
+</html>
