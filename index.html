@@ -615,7 +615,15 @@ function tick() {
     if (a.shoot_cd > 0) a.shoot_cd--;
     if (a.shoot_flash && --a.shoot_flash.ttl <= 0) a.shoot_flash = null;
 
-    if (a.hp === 0) { respawnTick(a); continue; }
+    if (a.hp === 0) {
+      // Dead agents carry nothing — null again explicitly
+      a.role         = null;
+      a.percepts     = null;
+      a.cover_target = null;
+      a.shoot_flash  = null;
+      respawnTick(a);
+      continue;
+    }
 
     const c      = evalConditions(a);
     interact(a, c);
@@ -680,6 +688,7 @@ function drawFlag(team, flag) {
 }
 
 function drawLoS(agent) {
+  if (!agent.percepts) return;
   const c  = COLORS[agent.team];
   const ef = FLAGS[agent.percepts.enemy_team];
   if (!ef) return;
@@ -811,7 +820,7 @@ function render() {
   for (const a of AGENTS) drawAgent(a);
 
   const sel = AGENTS.find(a => a.id === selectedId);
-  if (sel && sel.percepts) {
+  if (sel && sel.percepts && sel.role) {
     const target = selectTarget(sel.role, sel.percepts, sel);   // FIX 2: pass agent
 
     if (target) {
